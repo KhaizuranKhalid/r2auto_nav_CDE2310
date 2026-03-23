@@ -1,272 +1,499 @@
+#!/usr/bin/env python3
+
+import math
+import heapq
+from collections import deque
+from typing import List, Tuple, Optional, Set
+
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from nav_msgs.msg import Odometry, OccupancyGrid
-from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
-from std_msgs.msg import String
-import numpy as np
-import math
-import heapq
-import time
-from scipy.ndimage import binary_dilation
-
-# TF2
-from tf2_ros import Buffer, TransformListener
 from rclpy.duration import Duration
 
-# -----------------------------
-# Constants
-# -----------------------------
-SPEED = 0.12
-ROT_SPEED = 0.5
-MAP_UNKNOWN = -1
-MAP_FREE = 0
-OCCUPIED_THRESHOLD = 50
-INFLATION_RADIUS = 1  # Increase if the robot still hits walls
-SAFE_DISTANCE = 0.20  # Reactive stop distance
+from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+
+import tf2_ros
+from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
+
+
+GridCell = Tuple[int, int]   # (row, col)
+Path = List[GridCell]
+
 
 class FrontierExplorer(Node):
     def __init__(self):
         super().__init__('frontier_explorer')
 
-        # -----------------------------
-        # TF2 Setup
-        # -----------------------------
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # -----------------------------
-        # Publishers
-        # -----------------------------
+        # Publishers / Subscribers
         self.cmd_pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.launch_ball_pub = self.create_publisher(String, 'launch_ball', 10)
-
-        # -----------------------------
-        # Subscribers
-        # -----------------------------
-        self.odom_sub = self.create_subscription(
-            Odometry, 'odom', self.odom_callback, 10)
-        self.occ_sub = self.create_subscription(
-            OccupancyGrid, 'map', self.occ_callback, qos_profile_sensor_data)
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, 'map', self.map_callback, qos_profile_sensor_data
+        )
         self.scan_sub = self.create_subscription(
-            LaserScan, 'scan', self.scan_callback, qos_profile_sensor_data)
+            LaserScan, 'scan', self.scan_callback, qos_profile_sensor_data
+        )
 
-        # -----------------------------
-        # State variables
-        # -----------------------------
-        self.roll = 0
-        self.pitch = 0
-        self.yaw = 0
-        self.occdata = None
-        self.inflated_occdata = None
-        self.latest_scan = None
-        self.map_width = self.map_height = 0
-        self.map_resolution = 0.0
-        self.map_origin = None
+        # TF for map -> base_link pose
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self.get_logger().info("Frontier Explorer Node Initialized and Waiting for Map...")
+        # Map state
+        self.map_grid = None              # values: -1 unknown, 0 free, 1 occupied
+        self.map_info = None
+        self.map_received = False
 
-    # -----------------------------
+        # Robot state
+        self.robot_x = None
+        self.robot_y = None
+        self.robot_yaw = None
+
+        # LiDAR state
+        self.scan = np.array([])
+
+        # Tuning parameters
+        self.frontier_min_size = 5
+        self.goal_tolerance = 0.20          # meters
+        self.linear_speed = 0.12            # m/s
+        self.angular_speed_limit = 0.8      # rad/s
+        self.k_linear = 0.6
+        self.k_angular = 1.8
+        self.obstacle_stop_distance = 0.25  # meters
+        self.base_frame = 'base_link'
+        self.map_frame = 'map'
+
+    # ----------------------------
     # Callbacks
-    # -----------------------------
-    def odom_callback(self, msg):
-        # If you need orientation, convert quaternion to roll, pitch, yaw
-        q = msg.pose.pose.orientation
-        self.yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
+    # ----------------------------
+    def map_callback(self, msg: OccupancyGrid):
+        self.map_info = msg.info
 
-    def occ_callback(self, msg):
-        self.map_width = msg.info.width
-        self.map_height = msg.info.height
-        self.map_resolution = msg.info.resolution
-        self.map_origin = msg.info.origin.position
-        self.occdata = np.array(msg.data, dtype=int).reshape((self.map_height, self.map_width))
+        raw = np.array(msg.data, dtype=np.int16).reshape((msg.info.height, msg.info.width))
 
-        # Inflate obstacles
-        occupied_mask = (self.occdata >= OCCUPIED_THRESHOLD)
-        struct = np.ones((INFLATION_RADIUS*2, INFLATION_RADIUS*2))
-        inflated_mask = binary_dilation(occupied_mask, structure=struct)
-        self.inflated_occdata = self.occdata.copy()
-        self.inflated_occdata[inflated_mask] = 100
+        # Normalize:
+        # -1 -> unknown
+        #  0..50 -> free
+        # 51..100 -> occupied
+        grid = np.full_like(raw, -1, dtype=np.int8)
+        grid[raw == -1] = -1
+        grid[(raw >= 0) & (raw <= 50)] = 0
+        grid[raw > 50] = 1
 
-    def scan_callback(self, msg):
-        self.latest_scan = np.array(msg.ranges)
+        self.map_grid = grid
+        self.map_received = True
 
-    # -----------------------------
-    # Pose using TF2
-    # -----------------------------
-    def get_robot_pose(self):
+    def scan_callback(self, msg: LaserScan):
+        self.scan = np.array(msg.ranges, dtype=np.float32)
+        self.scan[self.scan == 0.0] = np.nan
+
+    # ----------------------------
+    # Pose helpers
+    # ----------------------------
+    def quaternion_to_yaw(self, qx, qy, qz, qw) -> float:
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def update_robot_pose(self) -> bool:
         try:
             trans = self.tf_buffer.lookup_transform(
-                'map', 'base_link', rclpy.time.Time(), timeout=Duration(seconds=0.5))
-            x = trans.transform.translation.x
-            y = trans.transform.translation.y
-            q = trans.transform.rotation
-            yaw = math.atan2(2*(q.w*q.z + q.x*q.y), 1 - 2*(q.y*q.y + q.z*q.z))
-            return x, y, yaw
-        except Exception as e:
-            self.get_logger().warn(f"Pose not available yet: {e}")
-            return None, None, None
+                self.map_frame,
+                self.base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.5)
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return False
 
-    # -----------------------------
-    # Coordinates & Logic
-    # -----------------------------
-    def world_to_grid(self, x, y):
-        if self.map_origin is None: return 0, 0
-        # Use floor division to get the correct cell index
-        gx = int((x - self.map_origin.x) / self.map_resolution)
-        gy = int((y - self.map_origin.y) / self.map_resolution)
-        return gx, gy
+        self.robot_x = trans.transform.translation.x
+        self.robot_y = trans.transform.translation.y
 
-    def grid_to_world(self, gx, gy):
-        # Center the coordinate in the middle of the cell
-        wx = (gx * self.map_resolution) + self.map_origin.x + (self.map_resolution / 2.0)
-        wy = (gy * self.map_resolution) + self.map_origin.y + (self.map_resolution / 2.0)
-        return wx, wy
+        q = trans.transform.rotation
+        self.robot_yaw = self.quaternion_to_yaw(q.x, q.y, q.z, q.w)
+        return True
 
-    def is_path_blocked(self):
-        if self.latest_scan is None: return False
-        # Check front 30 degrees
-        n = len(self.latest_scan)
-        front = np.concatenate((self.latest_scan[:n//12], self.latest_scan[-n//12:]))
-        valid = front[(front > 0.01) & (front < SAFE_DISTANCE)]
-        return len(valid) > 0
+    # ----------------------------
+    # Grid helpers
+    # ----------------------------
+    def in_bounds(self, row: int, col: int) -> bool:
+        return (
+            self.map_grid is not None and
+            0 <= row < self.map_grid.shape[0] and
+            0 <= col < self.map_grid.shape[1]
+        )
 
-    def get_frontiers(self):
-        if self.occdata is None or self.inflated_occdata is None: return []
-        
-        # Find all free cells that are NOT inflated (safe to stand)
-        safe_free_mask = (self.occdata == MAP_FREE) & (self.inflated_occdata < OCCUPIED_THRESHOLD)
-        
-        # Find coordinates
-        y_coords, x_coords = np.where(safe_free_mask)
-        frontiers = []
-        
-        for x, y in zip(x_coords, y_coords):
-            # Check 8-neighbors for UNKNOWN
-            # We use a 3x3 slice for speed
-            if MAP_UNKNOWN in self.occdata[y-1:y+2, x-1:x+2]:
-                frontiers.append((x, y))
-                
-        return frontiers
+    def is_free(self, row: int, col: int) -> bool:
+        return self.in_bounds(row, col) and self.map_grid[row, col] == 0
 
-    # -----------------------------
-    # Navigation
-    # -----------------------------
-    def astar(self, start, goal):
-        open_set = []
-        heapq.heappush(open_set, (0, start))
+    def is_unknown(self, row: int, col: int) -> bool:
+        return self.in_bounds(row, col) and self.map_grid[row, col] == -1
+
+    def is_occupied(self, row: int, col: int) -> bool:
+        return self.in_bounds(row, col) and self.map_grid[row, col] == 1
+
+    def world_to_grid(self, x: float, y: float) -> Optional[GridCell]:
+        if self.map_info is None:
+            return None
+
+        res = self.map_info.resolution
+        ox = self.map_info.origin.position.x
+        oy = self.map_info.origin.position.y
+
+        col = int((x - ox) / res)
+        row = int((y - oy) / res)
+
+        if not self.in_bounds(row, col):
+            return None
+        return (row, col)
+
+    def grid_to_world(self, row: int, col: int) -> Tuple[float, float]:
+        res = self.map_info.resolution
+        ox = self.map_info.origin.position.x
+        oy = self.map_info.origin.position.y
+
+        x = ox + (col + 0.5) * res
+        y = oy + (row + 0.5) * res
+        return x, y
+
+    def neighbors4(self, row: int, col: int):
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = row + dr, col + dc
+            if self.in_bounds(nr, nc):
+                yield nr, nc
+
+    def neighbors8(self, row: int, col: int):
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = row + dr, col + dc
+                if self.in_bounds(nr, nc):
+                    yield nr, nc
+
+    # ----------------------------
+    # Frontier detection
+    # Frontier = free cell adjacent to at least one unknown cell
+    # ----------------------------
+    def cell_is_frontier(self, row: int, col: int) -> bool:
+        if not self.is_free(row, col):
+            return False
+        for nr, nc in self.neighbors8(row, col):
+            if self.is_unknown(nr, nc):
+                return True
+        return False
+
+    def detect_frontiers(self) -> List[List[GridCell]]:
+        """
+        Returns a list of frontier clusters.
+        Each cluster is a list of free cells that border unknown space.
+        """
+        if self.map_grid is None:
+            return []
+
+        if self.robot_x is None or self.robot_y is None:
+            return []
+
+        start = self.world_to_grid(self.robot_x, self.robot_y)
+        if start is None:
+            return []
+
+        sr, sc = start
+        if not self.is_free(sr, sc):
+            return []
+
+        # Flood-fill through reachable free space only
+        reachable_free = set()
+        q = deque([start])
+        reachable_free.add(start)
+
+        frontier_cells = set()
+
+        while q:
+            r, c = q.popleft()
+
+            if self.cell_is_frontier(r, c):
+                frontier_cells.add((r, c))
+
+            for nr, nc in self.neighbors4(r, c):
+                if (nr, nc) in reachable_free:
+                    continue
+                if self.is_free(nr, nc):
+                    reachable_free.add((nr, nc))
+                    q.append((nr, nc))
+
+        # Cluster frontier cells using 8-connectivity
+        clusters = []
+        unvisited = set(frontier_cells)
+
+        while unvisited:
+            seed = unvisited.pop()
+            cluster = [seed]
+            fq = deque([seed])
+
+            while fq:
+                r, c = fq.popleft()
+                for nr, nc in self.neighbors8(r, c):
+                    if (nr, nc) in unvisited:
+                        unvisited.remove((nr, nc))
+                        cluster.append((nr, nc))
+                        fq.append((nr, nc))
+
+            if len(cluster) >= self.frontier_min_size:
+                clusters.append(cluster)
+
+        return clusters
+
+    def choose_frontier_target(self, clusters: List[List[GridCell]]) -> Optional[GridCell]:
+        """
+        Pick the best cluster using a simple score:
+        larger clusters are better, but closer ones are also preferred.
+        Then choose a representative cell in that cluster.
+        """
+        if not clusters:
+            return None
+
+        robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
+        if robot_cell is None:
+            return None
+
+        rr, rc = robot_cell
+
+        def cluster_score(cluster: List[GridCell]) -> float:
+            centroid_r = sum(p[0] for p in cluster) / len(cluster)
+            centroid_c = sum(p[1] for p in cluster) / len(cluster)
+            dist = abs(centroid_r - rr) + abs(centroid_c - rc)
+            return len(cluster) / (dist + 1.0)
+
+        best_cluster = max(clusters, key=cluster_score)
+
+        # Use the frontier cell in this cluster closest to the robot
+        target = min(best_cluster, key=lambda p: abs(p[0] - rr) + abs(p[1] - rc))
+        return target
+
+    # ----------------------------
+    # A* path planning
+    # ----------------------------
+    def heuristic(self, a: GridCell, b: GridCell) -> float:
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def astar(self, start: GridCell, goal: GridCell) -> Path:
+        if self.map_grid is None:
+            return []
+        if not self.is_free(*start):
+            return []
+        if not self.is_free(*goal):
+            return []
+
+        open_heap = []
+        heapq.heappush(open_heap, (0.0, start))
         came_from = {}
-        g_score = {start: 0}
+        g_score = {start: 0.0}
+        closed = set()
 
-        while open_set:
-            _, current = heapq.heappop(open_set)
-            if math.hypot(current[0]-goal[0], current[1]-goal[1]) < 2:
-                path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
-                return path[::-1]
+        while open_heap:
+            _, current = heapq.heappop(open_heap)
 
-            for dx, dy in [(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]:
-                neighbor = (current[0]+dx, current[1]+dy)
-                if 0 <= neighbor[0] < self.map_width and 0 <= neighbor[1] < self.map_height:
-                    # Plan using INFLATED map
-                    if self.inflated_occdata[neighbor[1], neighbor[0]] == MAP_FREE:
-                        cost = 1.414 if abs(dx)+abs(dy)==2 else 1.0
-                        ten_g = g_score[current] + cost
-                        if neighbor not in g_score or ten_g < g_score[neighbor]:
-                            came_from[neighbor] = current
-                            g_score[neighbor] = ten_g
-                            f = ten_g + math.hypot(goal[0]-neighbor[0], goal[1]-neighbor[1])
-                            heapq.heappush(open_set, (f, neighbor))
-        return None
+            if current in closed:
+                continue
+            closed.add(current)
 
-    def move_to(self, wx, wy):
-        self.get_logger().info(f"Target: {wx:.2f}, {wy:.2f}")
+            if current == goal:
+                return self.reconstruct_path(came_from, current)
+
+            for neighbor in self.neighbors4(*current):
+                nr, nc = neighbor
+                if not self.is_free(nr, nc):
+                    continue
+
+                tentative_g = g_score[current] + 1.0
+                if tentative_g < g_score.get(neighbor, float('inf')):
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score = tentative_g + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_heap, (f_score, neighbor))
+
+        return []
+
+    def reconstruct_path(self, came_from: dict, current: GridCell) -> Path:
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            path.append(current)
+        path.reverse()
+        return path
+
+    # ----------------------------
+    # Motion control
+    # ----------------------------
+    def stop_robot(self):
+        twist = Twist()
+        self.cmd_pub.publish(twist)
+
+    def front_distance(self) -> float:
+        if self.scan.size == 0:
+            return float('inf')
+
+        n = len(self.scan)
+        mid = n // 2
+        span = max(1, int(15 * n / 360))  # roughly +/-15 degrees
+
+        sector = self.scan[max(0, mid - span): min(n, mid + span + 1)]
+        sector = sector[np.isfinite(sector)]
+
+        if sector.size == 0:
+            return float('inf')
+        return float(np.min(sector))
+
+    def angle_wrap(self, ang: float) -> float:
+        return (ang + math.pi) % (2.0 * math.pi) - math.pi
+
+    def move_to_waypoint(self, goal_world: Tuple[float, float]) -> bool:
+        """
+        Move toward one waypoint.
+        Returns False if we hit an obstacle and need to replan.
+        """
+        gx, gy = goal_world
+
+        rate_spin_count = 0
         while rclpy.ok():
-            curr_x, curr_y, curr_yaw = self.get_robot_pose()
-            if curr_x is None: break
-
-            dx, dy = wx - curr_x, wy - curr_y
-            dist = math.hypot(dx, dy)
-            if dist < 0.18: break
-
-            target_yaw = math.atan2(dy, dx)
-            angle_diff = math.atan2(math.sin(target_yaw - curr_yaw), math.cos(target_yaw - curr_yaw))
-
-            twist = Twist()
-            blocked = self.is_path_blocked()
-
-            if abs(angle_diff) > 0.5:
-                twist.angular.z = ROT_SPEED * np.sign(angle_diff)
-            elif blocked:
-                self.get_logger().warn("Obstacle! Nudging away.")
-                twist.linear.x = 0.0
-                twist.angular.z = ROT_SPEED
-            else:
-                twist.linear.x = SPEED
-                twist.angular.z = 0.3 * angle_diff
-
-            self.cmd_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.05)
-            if blocked: return # Exit to re-plan if blocked
-
-    def rotate(self):
-        t = Twist()
-        t.angular.z = ROT_SPEED
-        self.cmd_pub.publish(t)
-        time.sleep(1.0)
-        self.cmd_pub.publish(Twist())
-
-    # -----------------------------
-    # Main Loop
-    # -----------------------------
-    def explore(self):
-        while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if self.occdata is None: continue
-
-            curr_x, curr_y, _ = self.get_robot_pose()
-            if curr_x is None: continue
-
-            frontiers = self.get_frontiers()
-            if not frontiers:
-                self.get_logger().info("No reachable frontiers. Rotating...")
-                self.rotate()
+            if not self.update_robot_pose():
                 continue
 
-            # Find closest reachable frontier
-            rgx, rgy = self.world_to_grid(curr_x, curr_y)
-            dists = [math.hypot(f[0]-rgx, f[1]-rgy) for f in frontiers]
-            sorted_indices = np.argsort(dists)
+            dx = gx - self.robot_x
+            dy = gy - self.robot_y
+            dist = math.hypot(dx, dy)
 
-            path = None
-            for idx in sorted_indices[:10]: # Try nearest 10
-                path = self.astar((rgx, rgy), frontiers[idx])
-                if path: break
+            if dist <= self.goal_tolerance:
+                self.stop_robot()
+                return True
 
-            if path:
-                # Look further ahead if the path is long, or just go to the end
-                # For a 4x4m area, 15 cells is about 75cm.
-                look_ahead = min(len(path) - 1, 15) 
-                target_node = path[look_ahead]
-                wx, wy = self.grid_to_world(target_node[0], target_node[1])
-                self.move_to(wx, wy)
+            # Safety stop if something is too close in front
+            if self.front_distance() < self.obstacle_stop_distance:
+                self.stop_robot()
+                return False
+
+            target_yaw = math.atan2(dy, dx)
+            yaw_error = self.angle_wrap(target_yaw - self.robot_yaw)
+
+            twist = Twist()
+
+            # Heading control
+            twist.angular.z = max(
+                -self.angular_speed_limit,
+                min(self.angular_speed_limit, self.k_angular * yaw_error)
+            )
+
+            # Move forward only if roughly facing the waypoint
+            if abs(yaw_error) < 0.5:
+                twist.linear.x = min(self.linear_speed, self.k_linear * dist)
             else:
-                self.get_logger().warn("A* failed to find a valid path to frontiers. Is the robot boxed in by inflation?")
-                self.rotate()
+                twist.linear.x = 0.0
+
+            self.cmd_pub.publish(twist)
+
+            rate_spin_count += 1
+            if rate_spin_count % 20 == 0:
+                self.get_logger().info(
+                    f"Moving to waypoint: dist={dist:.2f}, yaw_error={math.degrees(yaw_error):.1f} deg"
+                )
+
+        return False
+
+    def follow_path(self, path: Path) -> bool:
+        if not path or len(path) < 2:
+            return True
+
+        for cell in path[1:]:
+            wx, wy = self.grid_to_world(*cell)
+            ok = self.move_to_waypoint((wx, wy))
+            if not ok:
+                return False
+
+        self.stop_robot()
+        return True
+    
+    def scan_environment(self):
+        twist = Twist()
+        twist.angular.z = 0.6
+
+        start_time = self.get_clock().now()
+
+        while (self.get_clock().now() - start_time).nanoseconds < 6e9:
+            self.cmd_pub.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        self.stop_robot()
+
+    # ----------------------------
+    # Main exploration loop
+    # ----------------------------
+    def explore(self):
+        self.get_logger().info("Waiting for map and TF...")
+
+        # Wait until map exists and pose can be read
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.map_received and self.update_robot_pose():
+                break
+
+        self.get_logger().info("Starting frontier exploration.")
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if not self.update_robot_pose():
+                continue
+
+            robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
+            if robot_cell is None:
+                self.get_logger().warn("Robot is outside the map.")
+                self.stop_robot()
+                continue
+
+            clusters = self.detect_frontiers()
+
+            if not clusters:
+                self.get_logger().info("No frontiers left. Exploration complete.")
+                self.stop_robot()
+                break
+
+            target_cell = self.choose_frontier_target(clusters)
+            if target_cell is None:
+                self.get_logger().warn("Could not choose a frontier target.")
+                self.stop_robot()
+                continue
+
+            path = self.astar(robot_cell, target_cell)
+
+            if not path:
+                self.get_logger().warn(f"No A* path to frontier target {target_cell}. Replanning...")
+                continue
+
+            self.get_logger().info(
+                f"Frontier target: {target_cell}, path length: {len(path)}"
+            )
+
+            success = self.follow_path(path)
+            
+            if not success:
+                self.get_logger().warn("Path was interrupted by obstacle. Replanning...")
+                continue
+            self.scan_environment()
+
+        self.stop_robot()
+
+
 def main(args=None):
     rclpy.init(args=args)
     node = FrontierExplorer()
     try:
         node.explore()
-    except KeyboardInterrupt:
-        pass
     finally:
-        node.cmd_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
