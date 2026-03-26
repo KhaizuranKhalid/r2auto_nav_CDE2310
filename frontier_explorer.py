@@ -12,6 +12,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.duration import Duration
 
 from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
@@ -22,6 +23,29 @@ from tf2_ros import LookupException, ConnectivityException, ExtrapolationExcepti
 GridCell = Tuple[int, int]   # (row, col)
 Path = List[GridCell]
 
+
+# code from https://automaticaddison.com/how-to-convert-a-quaternion-into-euler-angles-in-python/
+def euler_from_quaternion(x, y, z, w):
+    """
+    Convert a quaternion into euler angles (roll, pitch, yaw)
+    roll is rotation around x in radians (counterclockwise)
+    pitch is rotation around y in radians (counterclockwise)
+    yaw is rotation around z in radians (counterclockwise)
+    """
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll_x = math.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    pitch_y = math.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw_z = math.atan2(t3, t4)
+
+    return roll_x, pitch_y, yaw_z # in radians
 
 class FrontierExplorer(Node):
     def __init__(self):
@@ -35,6 +59,17 @@ class FrontierExplorer(Node):
         self.scan_sub = self.create_subscription(
             LaserScan, 'scan', self.scan_callback, qos_profile_sensor_data
         )
+        # Odometry fallback (used if TF is unavailable)
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            'odom',
+            self.odom_callback,
+            10
+        )
+
+        self.odom_x = None
+        self.odom_y = None
+        self.odom_yaw = None
 
         # TF for map -> base_link pose
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=5.0))
@@ -54,10 +89,11 @@ class FrontierExplorer(Node):
         self.scan = np.array([])
 
         # Tuning parameters
-        self.frontier_min_size = 5
+        self.failed_goals = set()           # type: Set[GridCell]
+        self.frontier_min_size = 10
         self.goal_tolerance = 0.20          # meters
-        self.linear_speed = 0.12            # m/s
-        self.angular_speed_limit = 0.8      # rad/s
+        self.linear_speed = 0.10            # m/s
+        self.angular_speed_limit = 0.6      # rad/s
         self.k_linear = 0.6
         self.k_angular = 1.8
         self.obstacle_stop_distance = 0.25  # meters
@@ -68,51 +104,93 @@ class FrontierExplorer(Node):
     # Callbacks
     # ----------------------------
     def map_callback(self, msg: OccupancyGrid):
+        self.get_logger().info("Map received")
         self.map_info = msg.info
 
-        raw = np.array(msg.data, dtype=np.int16).reshape((msg.info.height, msg.info.width))
+        raw = np.array(msg.data, dtype=np.int16).reshape(
+            (msg.info.height, msg.info.width)
+        )
 
-        # Normalize:
-        # -1 -> unknown
-        #  0..50 -> free
-        # 51..100 -> occupied
         grid = np.full_like(raw, -1, dtype=np.int8)
         grid[raw == -1] = -1
         grid[(raw >= 0) & (raw <= 50)] = 0
         grid[raw > 50] = 1
 
-        self.map_grid = grid
+        # Mild obstacle inflation
+        inflation_radius = 4
+        inflated = grid.copy()
+
+        height, width = grid.shape
+
+        for r in range(height):
+            for c in range(width):
+                if grid[r, c] == 1:
+                    for dr in range(-inflation_radius, inflation_radius + 1):
+                        for dc in range(-inflation_radius, inflation_radius + 1):
+                            rr = r + dr
+                            cc = c + dc
+                            if 0 <= rr < height and 0 <= cc < width:
+                                if inflated[rr, cc] == 0:
+                                    inflated[rr, cc] = 1
+
+        self.map_grid = inflated
         self.map_received = True
 
     def scan_callback(self, msg: LaserScan):
         self.scan = np.array(msg.ranges, dtype=np.float32)
         self.scan[self.scan == 0.0] = np.nan
 
+    def odom_callback(self, msg):
+        pos = msg.pose.pose.position
+        self.odom_x = pos.x
+        self.odom_y = pos.y
+
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion(
+            q.x, q.y, q.z, q.w
+        )
+
+        self.odom_yaw = yaw
+
     # ----------------------------
     # Pose helpers
     # ----------------------------
-    def quaternion_to_yaw(self, qx, qy, qz, qw) -> float:
-        siny_cosp = 2.0 * (qw * qz + qx * qy)
-        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-        return math.atan2(siny_cosp, cosy_cosp)
+    # def quaternion_to_yaw(self, qx, qy, qz, qw) -> float:
+    #     siny_cosp = 2.0 * (qw * qz + qx * qy)
+    #     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    #     return math.atan2(siny_cosp, cosy_cosp)
 
     def update_robot_pose(self) -> bool:
+        # Try TF first (best for SLAM)
         try:
+            self.get_logger().info("TF pose received")
             trans = self.tf_buffer.lookup_transform(
                 self.map_frame,
                 self.base_frame,
-                rclpy.time.Time(),
-                timeout=Duration(seconds=0.5)
+                rclpy.time.Time(seconds=0),
+                timeout=Duration(seconds=0.3)
             )
+
+            self.robot_x = trans.transform.translation.x
+            self.robot_y = trans.transform.translation.y
+
+            q = trans.transform.rotation
+            self.robot_yaw = euler_from_quaternion(q.x, q.y, q.z, q.w)
+
+            return True
+
         except (LookupException, ConnectivityException, ExtrapolationException):
-            return False
+            pass
 
-        self.robot_x = trans.transform.translation.x
-        self.robot_y = trans.transform.translation.y
+        # Fallback to odom if TF not ready
+        self.get_logger().info("Using odom fallback")
+        if self.odom_x is not None:
+            self.robot_x = self.odom_x
+            self.robot_y = self.odom_y
+            self.robot_yaw = self.odom_yaw
+            return True
 
-        q = trans.transform.rotation
-        self.robot_yaw = self.quaternion_to_yaw(q.x, q.y, q.z, q.w)
-        return True
+        return False
 
     # ----------------------------
     # Grid helpers
@@ -179,10 +257,13 @@ class FrontierExplorer(Node):
     def cell_is_frontier(self, row: int, col: int) -> bool:
         if not self.is_free(row, col):
             return False
-        for nr, nc in self.neighbors8(row, col):
+
+        unknown_count = 0
+        for nr, nc in self.neighbors4(row, col):
             if self.is_unknown(nr, nc):
-                return True
-        return False
+                unknown_count += 1
+
+        return unknown_count >= 1
 
     def detect_frontiers(self) -> List[List[GridCell]]:
         """
@@ -200,7 +281,7 @@ class FrontierExplorer(Node):
             return []
 
         sr, sc = start
-        if not self.is_free(sr, sc):
+        if self.is_occupied(sr, sc):
             return []
 
         # Flood-fill through reachable free space only
@@ -244,33 +325,98 @@ class FrontierExplorer(Node):
                 clusters.append(cluster)
 
         return clusters
+    # Choose the best center cell of the largest frontier cluster, with some distance penalty
+    # def choose_frontier_target(self, clusters):
+    #     robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
+    #     if robot_cell is None:
+    #         return None
 
-    def choose_frontier_target(self, clusters: List[List[GridCell]]) -> Optional[GridCell]:
-        """
-        Pick the best cluster using a simple score:
-        larger clusters are better, but closer ones are also preferred.
-        Then choose a representative cell in that cluster.
-        """
-        if not clusters:
-            return None
+    #     rr, rc = robot_cell
+    #     best_score = -1
+    #     best_target = None
 
+    #     for cluster in clusters:
+    #         # choose center of cluster
+    #         cr = int(sum(p[0] for p in cluster) / len(cluster))
+    #         cc = int(sum(p[1] for p in cluster) / len(cluster))
+
+    #         if self.near_obstacle(cr, cc):
+    #             continue
+
+    #         dist = math.hypot(cr - rr, cc - rc)
+
+    #         # better scoring
+    #         score = len(cluster) - dist * 0.5
+
+    #         if score > best_score:
+    #             best_score = score
+    #             best_target = (cr, cc)
+
+    #     return best_target
+
+    # Choose the closest cell in any frontier cluster, with obstacle penalty
+    def choose_frontier_target(self, clusters):
         robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
         if robot_cell is None:
             return None
 
         rr, rc = robot_cell
+        best_dist = float('inf')
+        best_target = None
 
-        def cluster_score(cluster: List[GridCell]) -> float:
-            centroid_r = sum(p[0] for p in cluster) / len(cluster)
-            centroid_c = sum(p[1] for p in cluster) / len(cluster)
-            dist = abs(centroid_r - rr) + abs(centroid_c - rc)
-            return len(cluster) / (dist + 1.0)
+        for cluster in clusters:
+            for cell in cluster:
+                r, c = cell
 
-        best_cluster = max(clusters, key=cluster_score)
+                if self.near_obstacle(r, c):
+                    continue
 
-        # Use the frontier cell in this cluster closest to the robot
-        target = min(best_cluster, key=lambda p: abs(p[0] - rr) + abs(p[1] - rc))
-        return target
+                dist = abs(r - rr) + abs(c - rc)
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_target = cell
+
+        return best_target
+    
+    def obstacle_ahead(self):
+        if self.scan.size == 0:
+            return False
+
+        n = len(self.scan)
+        mid = n // 2
+
+        left = self.scan[mid + 20]
+        right = self.scan[mid - 20]
+
+        front = self.front_distance()
+
+        return min(front, left, right) < self.obstacle_stop_distance
+
+    def near_obstacle(self, r, c):
+        clearance = 6   # try 6–10
+
+        for dr in range(-clearance, clearance + 1):
+            for dc in range(-clearance, clearance + 1):
+                rr = r + dr
+                cc = c + dc
+                if self.in_bounds(rr, cc) and self.is_occupied(rr, cc):
+                    return True
+        return False
+    
+    def recover_exploration(self):
+        self.get_logger().info("Recovery behavior: scanning for new frontiers")
+
+        twist = Twist()
+        twist.angular.z = 0.8
+
+        start_time = self.get_clock().now()
+
+        while (self.get_clock().now() - start_time).nanoseconds < 8e9:
+            self.cmd_pub.publish(twist)
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+        self.stop_robot()
 
     # ----------------------------
     # A* path planning
@@ -283,7 +429,7 @@ class FrontierExplorer(Node):
             return []
         if not self.is_free(*start):
             return []
-        if not self.is_free(*goal):
+        if self.is_occupied(*goal):
             return []
 
         open_heap = []
@@ -371,7 +517,7 @@ class FrontierExplorer(Node):
                 return True
 
             # Safety stop if something is too close in front
-            if self.front_distance() < self.obstacle_stop_distance:
+            if self.obstacle_ahead() < self.obstacle_stop_distance:
                 self.stop_robot()
                 return False
 
@@ -441,6 +587,9 @@ class FrontierExplorer(Node):
 
         self.get_logger().info("Starting frontier exploration.")
 
+        self.get_logger().info("Initial scan to build map")
+        self.recover_exploration()
+
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             if not self.update_robot_pose():
@@ -455,10 +604,17 @@ class FrontierExplorer(Node):
             clusters = self.detect_frontiers()
 
             if not clusters:
-                self.get_logger().info("No frontiers left. Exploration complete.")
-                self.stop_robot()
-                break
+                self.recover_exploration()
 
+                clusters = self.detect_frontiers()
+                if not clusters:
+                    self.get_logger().info("Exploration finished.")
+                    break
+
+            clusters = [
+                c for c in clusters
+                if all(cell not in self.failed_goals for cell in c)
+            ]
             target_cell = self.choose_frontier_target(clusters)
             if target_cell is None:
                 self.get_logger().warn("Could not choose a frontier target.")
@@ -468,6 +624,7 @@ class FrontierExplorer(Node):
             path = self.astar(robot_cell, target_cell)
 
             if not path:
+                # self.failed_goals.add(target_cell)
                 self.get_logger().warn(f"No A* path to frontier target {target_cell}. Replanning...")
                 continue
 
@@ -479,6 +636,7 @@ class FrontierExplorer(Node):
             
             if not success:
                 self.get_logger().warn("Path was interrupted by obstacle. Replanning...")
+                self.failed_goals.add(target_cell)
                 continue
             self.scan_environment()
 
