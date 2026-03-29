@@ -5,7 +5,6 @@ from collections import deque
 from typing import List, Tuple, Optional, Set
 
 import numpy as np
-from scipy.ndimage import binary_dilation
 
 import rclpy
 from rclpy.node import Node
@@ -65,7 +64,7 @@ class FrontierExplorer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # Map state
-        self.map_grid = None
+        self.map_grid: Optional[np.ndarray] = None
         self.map_info = None
         self.map_received = False
 
@@ -78,7 +77,7 @@ class FrontierExplorer(Node):
         self.scan = np.array([])
 
         # Frontier params
-        self.frontier_min_size = 10
+        self.frontier_min_size = 1
         self.failed_goals: Set[GridCell] = set()
 
     # ----------------------------
@@ -89,18 +88,14 @@ class FrontierExplorer(Node):
         raw = np.array(msg.data, dtype=np.int16).reshape(
             (msg.info.height, msg.info.width)
         )
+        # 0=free, 1=occupied, -1=unknown
         grid = np.full_like(raw, -1, dtype=np.int8)
         grid[raw == -1] = -1
         grid[(raw >= 0) & (raw <= 50)] = 0
         grid[raw > 50] = 1
 
-        # Fast obstacle inflation
-        structure = np.ones((3, 3), dtype=np.int8)
-        inflated = binary_dilation(grid == 1, structure=structure).astype(np.int8)
-        inflated[grid == -1] = -1
-        inflated[grid == 1] = 1
-
-        self.map_grid = inflated
+        # NO inflation needed; Nav2 handles obstacles
+        self.map_grid = grid
         self.map_received = True
 
     def scan_callback(self, msg: LaserScan):
@@ -157,22 +152,25 @@ class FrontierExplorer(Node):
     # Frontier detection
     # ----------------------------
     def cell_is_frontier(self, row: int, col: int) -> bool:
+        """A frontier cell is free and touches unknown space (8-connectivity)."""
         if not self.is_free(row, col):
             return False
-        return any(self.is_unknown(nr, nc) for nr, nc in self.neighbors4(row, col))
+        return any(self.is_unknown(nr, nc) for nr, nc in self.neighbors8(row, col))
 
     def detect_frontiers(self) -> List[List[GridCell]]:
+        """Detect all reachable frontier clusters from robot pose."""
         if self.map_grid is None or self.robot_x is None:
             return []
 
         start = self.world_to_grid(self.robot_x, self.robot_y)
-        if start is None or self.is_occupied(*start):
+        if start is None:
             return []
 
-        # BFS reachable free
+        # BFS reachable free cells
         reachable_free = set([start])
         q = deque([start])
         frontier_cells = set()
+
         while q:
             r, c = q.popleft()
             if self.cell_is_frontier(r, c):
@@ -182,7 +180,7 @@ class FrontierExplorer(Node):
                     reachable_free.add((nr, nc))
                     q.append((nr, nc))
 
-        # Cluster frontier cells (8-connectivity)
+        # Cluster frontier cells using 8-connectivity
         clusters = []
         unvisited = set(frontier_cells)
         while unvisited:
@@ -198,29 +196,37 @@ class FrontierExplorer(Node):
                         fq.append((nr, nc))
             if len(cluster) >= self.frontier_min_size:
                 clusters.append(cluster)
+
         return clusters
 
     def choose_frontier_target(self, clusters: List[List[GridCell]]) -> Optional[GridCell]:
+        """Choose the frontier cluster closest to the robot, avoiding obstacles."""
         robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
         if robot_cell is None:
             return None
         rr, rc = robot_cell
         best_target = None
         best_dist = float('inf')
+
         for cluster in clusters:
-            # Use centroid as target
+            # centroid
             r_mean = int(sum(r for r, _ in cluster) / len(cluster))
             c_mean = int(sum(c for _, c in cluster) / len(cluster))
+
+            # skip if centroid touches obstacles
             if any(self.is_occupied(nr, nc) for nr, nc in self.neighbors8(r_mean, c_mean)):
                 continue
+
+            # Manhattan distance to robot (fast)
             dist = abs(r_mean - rr) + abs(c_mean - rc)
             if dist < best_dist:
                 best_dist = dist
                 best_target = (r_mean, c_mean)
+
         return best_target
 
     # ----------------------------
-    # Robot pose
+    # Robot pose update
     # ----------------------------
     def update_robot_pose(self) -> bool:
         try:
@@ -270,6 +276,7 @@ class FrontierExplorer(Node):
     def explore(self):
         self.get_logger().info("Waiting for map and transform...")
 
+        # wait until we get map and robot pose
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.1)
             if self.map_received and self.update_robot_pose():
@@ -282,12 +289,8 @@ class FrontierExplorer(Node):
             if not self.update_robot_pose():
                 continue
 
-            robot_cell = self.world_to_grid(self.robot_x, self.robot_y)
-            if robot_cell is None:
-                self.get_logger().warn("Robot outside map boundaries")
-                continue
-
             clusters = self.detect_frontiers()
+            # remove clusters containing failed goals
             clusters = [c for c in clusters if not any(cell in self.failed_goals for cell in c)]
             if not clusters:
                 self.get_logger().info("No reachable frontiers left. Exploration finished.")
